@@ -19,13 +19,33 @@ import comfy.model_patcher
 from .device_utils import get_device_list, soft_empty_cache_multigpu
 from .model_management_mgpu import multigpu_memory_log, force_full_system_cleanup
 
-
+def bc_unpack_block(block_list):
+    """Backward compatible support for new block scheme in comfy/model_patcher.
+    New blocks: (module_offload_mem), module_size, module_name, module_object, params
+    """
+    return [[None, *block] if len(block) == 4 else block for block in block_list]
+    
 def register_patched_safetensor_modelpatcher():
     """Register and patch the ModelPatcher for distributed safetensor loading"""
-    from comfy.model_patcher import wipe_lowvram_weight, move_weight_functions
-    # Patch ComfyUI's ModelPatcher
-    if not hasattr(comfy.model_patcher.ModelPatcher, '_distorch_patched'):
+    from comfy.model_patcher import wipe_lowvram_weight, move_weight_functions, get_key_weight
+    
+    # Patch get_key_weight to handle missing bias (Fix from new script)
+    original_get_key_weight = comfy.model_patcher.get_key_weight
+    
+    def patched_get_key_weight(model, key):
+        """Patched version that handles missing attributes like bias in RMSNorm"""
+        try:
+            result = original_get_key_weight(model, key)
+            return result
+        except AttributeError as e:
+            # If attribute doesn't exist (e.g., bias in RMSNorm), return None
+            if "has no attribute" in str(e):
+                return None, None, None
+            raise
+    
+    comfy.model_patcher.get_key_weight = patched_get_key_weight
 
+    if not hasattr(comfy.model_patcher.ModelPatcher, '_distorch_patched'):
 
         # PATCH load_models_gpu with correct memory calculations per model flags
         original_load_models_gpu = mm.load_models_gpu
@@ -206,12 +226,10 @@ def register_patched_safetensor_modelpatcher():
             """Override to use direct model annotation for allocation"""
             
             mp_id = id(self)
-            mp_patches_uuid = self.patches_uuid
             inner_model = self.model
-            inner_model_id = id(inner_model)
             
             if not hasattr(inner_model, "_distorch_v2_meta"):
-                logger.debug(f"[DISTORCH_SKIP] ModelPatcher=0x{mp_id:x} inner_model=0x{inner_model_id:x} type={type(inner_model).__name__} - no metadata, using standard loading")
+                logger.debug(f"[DISTORCH_SKIP] ModelPatcher=0x{mp_id:x} type={type(inner_model).__name__} - no metadata, using standard loading")
                 result = original_partially_load(self, device_to, extra_memory, force_patch_weights)
                 if hasattr(self, '_distorch_block_assignments'):
                     del self._distorch_block_assignments
@@ -225,61 +243,139 @@ def register_patched_safetensor_modelpatcher():
             if not hasattr(self.model, 'current_weight_patches_uuid'):
                 self.model.current_weight_patches_uuid = None
 
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
             unpatch_weights = self.model.current_weight_patches_uuid is not None and (self.model.current_weight_patches_uuid != self.patches_uuid or force_patch_weights)
 
             if unpatch_weights:
                 logger.debug(f"[MultiGPU DisTorch V2] Patches changed or forced. Unpatching model.")
                 self.unpatch_model(self.offload_device, unpatch_weights=True)
+                
+                # Cleanup flags
+                for m in self.model.modules():
+                    try: del m.comfy_cast_weights
+                    except AttributeError: pass
+                    try: del m.comfy_patched_weights
+                    except AttributeError: pass
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+            # Check if this is a re-run with same patches AND already properly set up by DisTorch
+            is_rerun_same_patches = (self.model.current_weight_patches_uuid == self.patches_uuid) and not force_patch_weights
+            has_distorch_setup = hasattr(self.model, '_distorch_setup_complete') and self.model._distorch_setup_complete
+            
+            if is_rerun_same_patches and has_distorch_setup:
+                # Fast exit for rerun
+                return 0
+
+            # Ensure all flags are reset before starting distribution
+            for m in self.model.modules():
+                if hasattr(m, 'comfy_cast_weights'):
+                    m.comfy_cast_weights = False
 
             self.patch_model(load_weights=False)
+
+            # Clear again after patch_model (just in case)
+            for m in self.model.modules():
+                if hasattr(m, 'comfy_cast_weights'):
+                    m.comfy_cast_weights = False
 
             mem_counter = 0
 
             is_clip_model = getattr(self, 'is_clip', False)
             device_assignments = analyze_safetensor_loading(self, allocations, is_clip=is_clip_model)
+            block_assignment_map = device_assignments['block_assignments']
             
             model_original_dtype = comfy.utils.weight_dtype(self.model.state_dict())
             high_precision_loras = getattr(self.model, "_distorch_high_precision_loras", True)
             loading = self._load_list()
             loading.sort(reverse=True)
-            for module_size, module_name, module_object, params in loading:
-                if not unpatch_weights and hasattr(module_object, "comfy_patched_weights") and module_object.comfy_patched_weights == True:
-                    block_target_device = device_assignments['block_assignments'].get(module_name, device_to)
+
+            for module_offload_mem, module_size, module_name, module_object, params in bc_unpack_block(loading):
+                
+                block_target_device = block_assignment_map.get(module_name, device_to)
+                
+                weight_key = "{}.weight".format(module_name)
+                bias_key = "{}.bias".format(module_name)
+
+                # Check if already on correct device with correct patches (Fast Path)
+                is_prepared = not unpatch_weights and hasattr(module_object, "comfy_patched_weights") and module_object.comfy_patched_weights == True
+                
+                if is_prepared:
                     current_module_device = None
                     try:
                         if any(p.numel() > 0 for p in module_object.parameters(recurse=False)):
-                           current_module_device = next(module_object.parameters(recurse=False)).device
+                            current_module_device = next(module_object.parameters(recurse=False)).device
                     except StopIteration:
                         pass
 
-                    if current_module_device is not None and str(current_module_device) != str(block_target_device):
-                        logger.debug(f"[MultiGPU DisTorch V2] Moving already patched {module_name} to {block_target_device}")
-                        module_object.to(block_target_device)
+                    is_on_target = current_module_device is not None and str(current_module_device) == str(block_target_device)
+                    
+                    if is_on_target:
+                        # Logic to maintain cast flags correctly even on fast path
+                        if str(block_target_device) != str(device_to):
+                            module_object.comfy_cast_weights = True
+                        else:
+                            module_object.comfy_cast_weights = False
+                        
+                        mem_counter += module_size
+                        continue
+                    
+                    # Not on target - need to restore and move (Slow Path / Fixup)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    
+                    if weight_key in self.backup:
+                        module_object.weight.data.copy_(self.backup[weight_key].to(device=module_object.weight.device))
+                    
+                    if hasattr(module_object, 'bias') and module_object.bias is not None and bias_key in self.backup:
+                        module_object.bias.data.copy_(self.backup[bias_key].to(device=module_object.bias.device))
+                    
+                    if hasattr(module_object, 'weight_function'):
+                        module_object.weight_function.clear()
+                    if hasattr(module_object, 'bias_function'):
+                        module_object.bias_function.clear()
+                    
+                    if str(current_module_device) != str(block_target_device):
+                         logger.debug(f"[MultiGPU DisTorch V2] Moving already patched {module_name} to {block_target_device}")
 
+                    module_object.to(block_target_device)
+                    
+                    if str(block_target_device) != str(device_to):
+                        module_object.comfy_cast_weights = True
+                    else:
+                        module_object.comfy_cast_weights = False
+                    
+                    module_object.comfy_patched_weights = True
                     mem_counter += module_size
                     continue
 
+                # STANDARD LOADING PATH
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
                 # Step 1: Write block/tensor to compute device first
                 module_object.to(device_to)
 
                 # Step 2: Apply LoRa patches while on compute device
-                weight_key = "{}.weight".format(module_name)
-                bias_key = "{}.bias".format(module_name)
-
                 if weight_key in self.patches:
                     self.patch_weight_to_device(weight_key, device_to=device_to)
+                
                 if weight_key in self.weight_wrapper_patches:
                     module_object.weight_function.extend(self.weight_wrapper_patches[weight_key])
 
-                if bias_key in self.patches:
-                    self.patch_weight_to_device(bias_key, device_to=device_to)
-                if bias_key in self.weight_wrapper_patches:
-                    module_object.bias_function.extend(self.weight_wrapper_patches[bias_key])
+                has_bias = hasattr(module_object, 'bias')
+                if has_bias and module_object.bias is not None:
+                    if bias_key in self.patches:
+                        self.patch_weight_to_device(bias_key, device_to=device_to)
+                    if bias_key in self.weight_wrapper_patches:
+                        module_object.bias_function.extend(self.weight_wrapper_patches[bias_key])
 
                 # Step 3: FP8 casting for CPU storage (if enabled)
-                block_target_device = device_assignments['block_assignments'].get(module_name, device_to)
-                has_patches = weight_key in self.patches or bias_key in self.patches
-
+                has_patches = weight_key in self.patches or (bias_key in self.patches and has_bias and module_object.bias is not None)
+                
                 if not high_precision_loras and block_target_device == "cpu" and has_patches and model_original_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
                     for param_name, param in module_object.named_parameters():
                         if param.dtype.is_floating_point:
@@ -290,24 +386,31 @@ def register_patched_safetensor_modelpatcher():
                             logger.debug(f"[MultiGPU DisTorch V2] Cast {module_name}.{param_name} to FP8 for CPU storage")
 
                 # Step 4: Move to ultimate destination based on DisTorch assignment
-                if block_target_device != device_to:
+                if str(block_target_device) != str(device_to):
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        
                     logger.debug(f"[MultiGPU DisTorch V2] Moving {module_name} from {device_to} to {block_target_device}")
                     module_object.to(block_target_device)
                     module_object.comfy_cast_weights = True
+                else:
+                    module_object.comfy_cast_weights = False
 
                 # Mark as patched and update memory counter
                 module_object.comfy_patched_weights = True
                 mem_counter += module_size
 
-            self.model.current_weight_patches_uuid = self.patches_uuid
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
+            self.model.current_weight_patches_uuid = self.patches_uuid
             self.model.device = device_to
+            self.model._distorch_setup_complete = True 
 
             logger.info("[MultiGPU DisTorch V2] DisTorch loading completed.")
             logger.info(f"[MultiGPU DisTorch V2] Total memory: {mem_counter / (1024 * 1024):.2f}MB")
 
             return 0
-
         
         comfy.model_patcher.ModelPatcher.partially_load = new_partially_load
         comfy.model_patcher.ModelPatcher._distorch_patched = True
@@ -321,7 +424,7 @@ def _extract_clip_head_blocks(raw_block_list, compute_device):
     head_memory = 0
     block_assignments = {}
     
-    for module_size, module_name, module_object, params in raw_block_list:
+    for module_offload_mem, module_size, module_name, module_object, params in bc_unpack_block(raw_block_list):
         if any(kw in module_name.lower() for kw in head_keywords):
             head_blocks.append((module_size, module_name, module_object, params))
             block_assignments[module_name] = compute_device
@@ -423,7 +526,7 @@ def analyze_safetensor_loading(model_patcher, allocations_string, is_clip=False)
     total_memory = 0
 
     raw_block_list = model_patcher._load_list()
-    total_memory = sum(module_size for module_size, _, _, _ in raw_block_list)
+    total_memory = sum(module_size for _, module_size, _, _, _ in bc_unpack_block(raw_block_list))
 
     MIN_BLOCK_THRESHOLD = total_memory * 0.0001
     logger.debug(f"[MultiGPU DisTorch V2] Total model memory: {total_memory} bytes")
@@ -441,7 +544,7 @@ def analyze_safetensor_loading(model_patcher, allocations_string, is_clip=False)
 
     # Build all_blocks list for summary (using full raw_block_list)
     all_blocks = []
-    for module_size, module_name, module_object, params in raw_block_list:
+    for module_offload_mem, module_size, module_name, module_object, params in bc_unpack_block(raw_block_list):
         block_type = type(module_object).__name__
         # Populate summary dictionaries
         block_summary[block_type] = block_summary.get(block_type, 0) + 1
@@ -450,7 +553,7 @@ def analyze_safetensor_loading(model_patcher, allocations_string, is_clip=False)
 
     # Use distributable blocks for actual allocation (for CLIP, this excludes heads)
     distributable_all_blocks = []
-    for module_size, module_name, module_object, params in distributable_raw:
+    for module_offload_mem, module_size, module_name, module_object, params in bc_unpack_block(distributable_raw):
         distributable_all_blocks.append((module_name, module_object, type(module_object).__name__, module_size))
 
     block_list = [b for b in distributable_all_blocks if b[3] >= MIN_BLOCK_THRESHOLD]
@@ -581,7 +684,7 @@ def parse_memory_string(mem_str):
 def calculate_fraction_from_byte_expert_string(model_patcher, byte_str):
     """Convert byte allocation string (e.g. 'cuda:1,4gb;cpu,*') to fractional VRAM allocation string respecting device order and byte quotas."""
     raw_block_list = model_patcher._load_list()
-    total_model_memory = sum(module_size for module_size, _, _, _ in raw_block_list)
+    total_model_memory = sum(module_size for _, module_size, _, _, _ in bc_unpack_block(raw_block_list))
     remaining_model_bytes = total_model_memory
 
     # Use a list of tuples to preserve the user-defined order
@@ -640,7 +743,7 @@ def calculate_fraction_from_byte_expert_string(model_patcher, byte_str):
 def calculate_fraction_from_ratio_expert_string(model_patcher, ratio_str):
     """Convert ratio allocation string (e.g. 'cuda:0,25%;cpu,75%') describing model split to fractional VRAM allocation string."""
     raw_block_list = model_patcher._load_list()
-    total_model_memory = sum(module_size for module_size, _, _, _ in raw_block_list)
+    total_model_memory = sum(module_size for _, module_size, _, _, _ in bc_unpack_block(raw_block_list))
 
     raw_ratios = {}
     for allocation in ratio_str.split(';'):
