@@ -377,9 +377,8 @@ def register_patched_safetensor_modelpatcher():
             # ============ Check embed_tokens weights AFTER all processing ============
             if embed_module is not None and hasattr(embed_module, 'weight'):
                 weight = embed_module.weight
-                _ = weight.float()
+                _ = weight.float().mean()
 
-            old_uuid = self.model.current_weight_patches_uuid
             self.model.current_weight_patches_uuid = self.patches_uuid
             self.model.device = device_to
 
