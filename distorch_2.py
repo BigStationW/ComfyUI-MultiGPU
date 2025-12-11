@@ -235,7 +235,6 @@ def register_patched_safetensor_modelpatcher():
             inner_model_id = id(inner_model)
             
             if not hasattr(inner_model, "_distorch_v2_meta"):
-                logger.debug(f"[DISTORCH_SKIP] ModelPatcher=0x{mp_id:x} inner_model=0x{inner_model_id:x} type={type(inner_model).__name__} - no metadata, using standard loading")
                 result = original_partially_load(self, device_to, extra_memory, force_patch_weights)
                 if hasattr(self, '_distorch_block_assignments'):
                     del self._distorch_block_assignments
@@ -249,44 +248,102 @@ def register_patched_safetensor_modelpatcher():
             if not hasattr(self.model, 'current_weight_patches_uuid'):
                 self.model.current_weight_patches_uuid = None
 
-            unpatch_weights = self.model.current_weight_patches_uuid is not None and (self.model.current_weight_patches_uuid != self.patches_uuid or force_patch_weights)
+            unpatch_weights = (
+                self.model.current_weight_patches_uuid is not None and 
+                (self.model.current_weight_patches_uuid != self.patches_uuid or force_patch_weights)
+            )
 
             if unpatch_weights:
-                logger.debug(f"[MultiGPU DisTorch V2] Patches changed or forced. Unpatching model.")
                 self.unpatch_model(self.offload_device, unpatch_weights=True)
+
+            # ============ KEY TEST: Check embed_tokens weights BEFORE patch_model ============
+            loading_pre = self._load_list()
+            embed_module = None
+            for _, _, name, obj, _ in bc_unpack_block(loading_pre):
+                if 'embed_tokens' in name:
+                    embed_module = obj
+                    embed_name = name
+                    break
 
             self.patch_model(load_weights=False)
 
             mem_counter = 0
 
             is_clip_model = getattr(self, 'is_clip', False)
+            
             device_assignments = analyze_safetensor_loading(self, allocations, is_clip=is_clip_model)
             
             model_original_dtype = comfy.utils.weight_dtype(self.model.state_dict())
+            
             high_precision_loras = getattr(self.model, "_distorch_high_precision_loras", True)
             loading = self._load_list()
             loading.sort(reverse=True)
+                        
+            skipped_count = 0
+            processed_count = 0
+            moved_count = 0
+            
+            module_states = []
+            
             for module_offload_mem, module_size, module_name, module_object, params in bc_unpack_block(loading):
-                if not unpatch_weights and hasattr(module_object, "comfy_patched_weights") and module_object.comfy_patched_weights == True:
-                    block_target_device = device_assignments['block_assignments'].get(module_name, device_to)
-                    current_module_device = None
-                    try:
-                        if any(p.numel() > 0 for p in module_object.parameters(recurse=False)):
-                           current_module_device = next(module_object.parameters(recurse=False)).device
-                    except StopIteration:
-                        pass
-
-                    if current_module_device is not None and str(current_module_device) != str(block_target_device):
-                        logger.debug(f"[MultiGPU DisTorch V2] Moving already patched {module_name} to {block_target_device}")
+                block_target_device = device_assignments['block_assignments'].get(module_name, device_to)
+                
+                has_comfy_patched = hasattr(module_object, "comfy_patched_weights")
+                comfy_patched_value = getattr(module_object, "comfy_patched_weights", None)
+                has_comfy_cast = hasattr(module_object, "comfy_cast_weights")
+                comfy_cast_value = getattr(module_object, "comfy_cast_weights", None)
+                
+                current_device = None
+                try:
+                    if any(p.numel() > 0 for p in module_object.parameters(recurse=False)):
+                        current_device = next(module_object.parameters(recurse=False)).device
+                except StopIteration:
+                    pass
+                
+                has_weight_func = hasattr(module_object, 'weight_function')
+                weight_func_len = len(module_object.weight_function) if has_weight_func else 0
+                has_bias_func = hasattr(module_object, 'bias_function')
+                bias_func_len = len(module_object.bias_function) if has_bias_func else 0
+                
+                can_skip = (
+                    not unpatch_weights and 
+                    has_comfy_patched and 
+                    comfy_patched_value == True
+                )
+                
+                if len(module_states) < 10 or processed_count + skipped_count >= len(loading) - 5:
+                    module_states.append({
+                        'name': module_name[:50],
+                        'current_device': str(current_device),
+                        'target_device': str(block_target_device),
+                        'comfy_patched': comfy_patched_value,
+                        'comfy_cast': comfy_cast_value,
+                        'weight_func_len': weight_func_len,
+                        'bias_func_len': bias_func_len,
+                        'can_skip': can_skip,
+                        'action': None
+                    })
+                
+                if can_skip:
+                    skipped_count += 1
+                    if module_states and module_states[-1]['name'] == module_name[:50]:
+                        module_states[-1]['action'] = 'SKIP'
+                    
+                    if current_device is not None and str(current_device) != str(block_target_device):
+                        moved_count += 1
+                        if module_states and module_states[-1]['name'] == module_name[:50]:
+                            module_states[-1]['action'] = 'SKIP+MOVE'
                         module_object.to(block_target_device)
 
                     mem_counter += module_size
                     continue
 
-                # Step 1: Write block/tensor to compute device first
+                processed_count += 1
+                if module_states and module_states[-1]['name'] == module_name[:50]:
+                    module_states[-1]['action'] = 'PROCESS'
+
                 module_object.to(device_to)
 
-                # Step 2: Apply LoRa patches while on compute device
                 weight_key = "{}.weight".format(module_name)
                 bias_key = "{}.bias".format(module_name)
 
@@ -300,8 +357,6 @@ def register_patched_safetensor_modelpatcher():
                 if bias_key in self.weight_wrapper_patches:
                     module_object.bias_function.extend(self.weight_wrapper_patches[bias_key])
 
-                # Step 3: FP8 casting for CPU storage (if enabled)
-                block_target_device = device_assignments['block_assignments'].get(module_name, device_to)
                 has_patches = weight_key in self.patches or bias_key in self.patches
 
                 if not high_precision_loras and block_target_device == "cpu" and has_patches and model_original_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
@@ -311,20 +366,21 @@ def register_patched_safetensor_modelpatcher():
                             new_param = torch.nn.Parameter(cast_data.to(torch.float8_e4m3fn))
                             new_param.requires_grad = param.requires_grad
                             setattr(module_object, param_name, new_param)
-                            logger.debug(f"[MultiGPU DisTorch V2] Cast {module_name}.{param_name} to FP8 for CPU storage")
 
-                # Step 4: Move to ultimate destination based on DisTorch assignment
                 if block_target_device != device_to:
-                    logger.debug(f"[MultiGPU DisTorch V2] Moving {module_name} from {device_to} to {block_target_device}")
                     module_object.to(block_target_device)
                     module_object.comfy_cast_weights = True
 
-                # Mark as patched and update memory counter
                 module_object.comfy_patched_weights = True
                 mem_counter += module_size
 
-            self.model.current_weight_patches_uuid = self.patches_uuid
+            # ============ Check embed_tokens weights AFTER all processing ============
+            if embed_module is not None and hasattr(embed_module, 'weight'):
+                weight = embed_module.weight
+                _ = weight.float()
 
+            old_uuid = self.model.current_weight_patches_uuid
+            self.model.current_weight_patches_uuid = self.patches_uuid
             self.model.device = device_to
 
             logger.info("[MultiGPU DisTorch V2] DisTorch loading completed.")
